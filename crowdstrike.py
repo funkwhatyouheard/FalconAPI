@@ -1,4 +1,4 @@
-import requests, getpass
+import requests, getpass, re
 from time import sleep
 
 class Falcon():
@@ -219,6 +219,51 @@ class Falcon():
         device_id = self.get_device_id_by_hostname(hostname)
         return self.get_device_details_by_id(device_id)
 
+    def get_device_scroll_ids(self,filter=None,offset=None):
+        if offset == None:
+            device_scroll_api = "{0}/devices/queries/devices-scroll/v1".format(self.api_base)
+        else:
+            device_scroll_api = "{0}/devices/queries/devices-scroll/v1?offset={1}".format(self.api_base,offset)
+        resp = self.session.get(device_scroll_api,params={"filter":filter})
+        host_ids = resp.json()['resources']
+        total = resp.json()['meta']['pagination']['total']
+        offset = resp.json()['meta']['pagination']['offset']
+        return host_ids, total, offset
+    
+    def get_all_device_ids(self,filter=None):
+        all_host_ids, total, offset = self.get_device_scroll_ids(filter=filter)
+        count = 0
+        while len(all_host_ids) <= total:
+            host_ids, total, offset = self.get_device_scroll_ids(filter=filter,offset=offset)
+            all_host_ids.extend(host_ids)
+            count +=1
+        return all_host_ids
+
+    def update_device_tags_by_id(self,device_ids,tags,action):
+        device_tag_api = "{0}/devices/entities/devices/tags/v1".format(self.api_base)
+        actions = ['add','remove']
+        if action not in actions:
+            raise ValueError("{0} must be one of the following values: {1}".format(action,",".join(actions)))
+        if not isinstance(device_ids,list):
+            device_ids=[device_ids]
+        if len(device_ids) > 5000:
+            raise ValueError("Cannot update more than 5000 devices in a single request, aborting")
+        if not isinstance(tags,list):
+            tags = [tags]
+        body = {
+            "device_ids":device_ids,
+            "action":"add",
+            "tags":["FalconGroupingTags/{0}".format(tag) for tag in tags]
+        }
+        resp = self.session.patch(device_tag_api,json=body)
+        return resp
+
+    def add_device_tags_by_id(self,device_ids,tags):
+        return self.update_device_tags_by_id(device_ids,tags,'add')
+
+    def remove_device_tags_by_id(self,device_ids,tags):
+        return self.update_device_tags_by_id(device_ids,tags,'remove')
+
     #names have to be all lowercase even if UI has some upper
     def get_device_group_id(self,name):
         search_filter = f'name:\'{name.lower()}\''
@@ -342,20 +387,92 @@ class Falcon():
         self.check_response(rtr_session)
         return rtr_session.json()['resources'][0]
 
+    def new_batch_rtr_session_by_id(self,device_ids,existing_batch_id="",queued=False):
+        # limitation put in place by CS
+        UPPER_BOUND = 10000
+        rtr_batch_session_api = f'{self.api_base}/real-time-response/combined/batch-init-session/v1'
+        if not isinstance(device_ids,list):
+            device_ids = [device_ids]
+        if len(device_ids) > UPPER_BOUND:
+            iterations = (len(device_ids)//UPPER_BOUND)+1
+            batch_ids = []
+            start = 0
+            end = UPPER_BOUND
+            while iterations != 0:
+                batch_ids += self.new_batch_rtr_session_by_id(device_ids[start:end],existing_batch_id,queued)
+                start = end
+                end = end + UPPER_BOUND
+                iterations = iterations - 1
+            return batch_ids
+        else:
+            body = {
+                "host_ids":device_ids,
+                "queue_offline":queued
+            }
+            if None != existing_batch_id and len(existing_batch_id) > 1:
+                body['existing_batch_id'] = existing_batch_id
+            rtr_session = self.session.post(url=rtr_batch_session_api,json=body)
+            self.check_response(rtr_session)
+            batch_id = [rtr_session.json()['batch_id']]
+            return batch_id
+
     def new_rtr_session_by_hostname(self,hostname,origin,queued=False):
         device_id = self.get_device_id_by_hostname(hostname)[0]
         rtr_session = self.new_rtr_session_by_id(device_id,origin,queued)
         return rtr_session
 
-    #pass a properly escaped command_string (or raw string r'')
-    def run_active_responder_command_by_session_id(self,session_id,base_command,command_string):
-        active_responder_api = f'{self.api_base}/real-time-response/entities/active-responder-command/v1'
+    def run_batch_active_responder_command_by_batch_id(self,batch_id,base_command,command_string,timeout_duration="30s",admin=False):
+        timeout_regex = r"^\d{1,2}(([num]?s)|m)$"
+        if not re.match(timeout_regex,timeout_duration):
+            raise ValueError("timeout_duration must be less than 10m and must be 1-2 digits with ns, us, ms, s, or m unit identifier")
+        commands = [
+            'cat','cd','clear','cp','encrypt','env','eventlog','filehash','get','getsid','help','history',
+            'ipconfig','kill','ls','map','memdump','mkdir','mount','mv','netstat','ps','reg query','reg set',
+            'reg delete','reg load','reg unload','restart','rm','runscript','shutdown','unmap','update history',
+            'update install','update list','update query','xmemdump','zip']
+        if admin:
+            active_responder_batch_api = "{0}/real-time-response/combined/batch-admin-command/v1?timeout_duration={1}".format(self.api_base,timeout_duration)
+            commands.extend(["put","update history","update install","update list","update query"])
+        else:
+            active_responder_batch_api = "{0}/real-time-response/combined/batch-active-responder-command/v1?timeout_duration={1}".format(self.api_base,timeout_duration)
+        
         cmd_string = command_string.replace("\\","/")
+        
+        if base_command not in commands:
+            raise ValueError(f'{base_command} is not an acceptable value for base_command. Ensure active responder is enabled for this host')
+        body = {
+            "base_command":base_command,
+            "command_string":f'{base_command} {cmd_string}',
+            "batch_id":batch_id
+        }
+        command = self.session.post(url=active_responder_batch_api,json=body)
+        self.check_response(command)
+        return command
+
+    def run_batch_active_responder_command_by_device_ids(self,device_ids,base_command,command_string,queued=False,timeout_duration="30s",admin=False):
+        timeout_regex = r"^\d{1,2}(([num]?s)|m)$"
+        if not re.match(timeout_regex,timeout_duration):
+            raise ValueError("timeout_duration must be less than 10m and must be 1-2 digits with ns, us, ms, s, or m unit identifier")
+        batch_ids = self.new_batch_rtr_session_by_id(device_ids,queued=queued)
+        command = {}
+        for batch_id in batch_ids:
+            resp = self.run_batch_active_responder_command_by_batch_id(batch_id,base_command,command_string,timeout_duration,admin=admin)
+            command.update(resp.json()['combined']['resources'])
+        return command
+
+    #pass a properly escaped command_string (or raw string r'')
+    def run_active_responder_command_by_session_id(self,session_id,base_command,command_string,admin=False):
         commands = [
             'cat','cd','clear','cp','encrypt','env','eventlog','filehash','get','getsid','help',
             'history','ipconfig','kill','ls','map','memdump','mkdir','mount','mv','netstat','ps',
             'reg query','reg set','reg delete','reg load','reg unload','restart','rm','runscript',
             'shutdown','unmap','xmemdump','zip']
+        if admin:
+            active_responder_api = f'{self.api_base}/real-time-response/entities/admin-command/v1'
+            commands.extend(["put","update history","update install","update list","update query"])
+        else:
+            active_responder_api = f'{self.api_base}/real-time-response/entities/active-responder-command/v1'
+        cmd_string = command_string.replace("\\","/")
         if base_command not in commands:
             raise ValueError(f'{base_command} is not an acceptable value for base_command. Ensure active responder is enabled for this host')
         body = {
@@ -367,14 +484,14 @@ class Falcon():
         self.check_response(command)
         return command
 
-    def run_active_responder_command_by_device_id(self,device_id,origin,base_command,command_string,queued=False):
+    def run_active_responder_command_by_device_id(self,device_id,origin,base_command,command_string,queued=False,admin=False):
         rtr_session = self.new_rtr_session_by_id(device_id,origin,queued)
-        command = self.run_active_responder_command_by_session_id(rtr_session['session_id'],base_command,command_string)
+        command = self.run_active_responder_command_by_session_id(rtr_session['session_id'],base_command,command_string,admin)
         return command
 
-    def run_active_responder_command_by_hostname(self,hostname,origin,base_command,command_string,queued=False):
+    def run_active_responder_command_by_hostname(self,hostname,origin,base_command,command_string,queued=False,admin=False):
         rtr_session = self.new_rtr_session_by_hostname(hostname,origin,queued)
-        command = self.run_active_responder_command_by_session_id(rtr_session['session_id'],base_command,command_string)
+        command = self.run_active_responder_command_by_session_id(rtr_session['session_id'],base_command,command_string,admin)
         return command
 
     def get_file_by_hostname(self,hostname,filepath,origin,queued=False):
@@ -383,6 +500,46 @@ class Falcon():
 
     def get_file_by_device_id(self,device_id,filepath,origin,queued=False):
         command = self.run_active_responder_command_by_device_id(device_id,origin,"get",filepath,queued)
+        return command
+
+    def logoff_user_by_hostname(self,hostname,username,origin,queued=False):
+        command = self.run_active_responder_command_by_hostname(hostname,origin,"runscript",f'-CloudFile=\"Logout-User\" -CommandLine=\"{username}\"',queued)
+        return command
+
+    def get_browser_history_files_by_hostname(self,hostname,origin,queued=False):
+        #have to pull it out b/c requires two commands
+        #the sleeps are stupid but the commands need to be sequential and were happening too quickly otherwise
+        rtr_session = self.new_rtr_session_by_hostname(hostname,origin,queued)
+        command = self.run_active_responder_command_by_session_id(rtr_session['session_id'],"runscript",f'-CloudFile=\"Get-BrowserHistoryFiles\" -CommandLine=\"\"')
+        sleep(1)
+        if command.json()['errors'] == None and command.ok:
+            command = self.run_active_responder_command_by_session_id(rtr_session['session_id'],"get",r"C:\Temp\BrowserHistory.zip")
+            sleep(1)
+            _ = self.run_active_responder_command_by_session_id(rtr_session['session_id'],"rm",r"C:\Temp\BrowserHistory.zip")
+        return command
+
+    def enable_psremoting_by_hostname(self,hostname,origin,queued=False):
+        command = self.run_active_responder_command_by_hostname(hostname=hostname,origin=origin,base_command="runscript",command_string=f'-CloudFile=\"Enable-PSRemoting\" -CommandLine=\"\"',queued=queued)
+        return command
+    
+    def disable_psremoting_by_hostname(self,hostname,origin,queued=False):
+        command = self.run_active_responder_command_by_hostname(hostname=hostname,origin=origin,base_command="runscript",command_string=f'-CloudFile=\"Disable-PSRemoting\" -CommandLine=\"\"',queued=queued)
+        return command
+
+    def inject_lsa_secret_by_hostname(self,hostname,origin,queued=False):
+        command = self.run_active_responder_command_by_hostname(hostname=hostname,origin=origin,base_command="runscript",command_string=f'-CloudFile=\"Inject-LSASecret\" -CommandLine=\"\"',queued=queued)
+        return command
+
+    def get_chrome_extensions_by_hostname(self,hostname,origin,queued=False):
+        #have to pull it out b/c requires two commands
+        #the sleeps are stupid but the commands need to be sequential and were happening too quickly otherwise
+        rtr_session = self.new_rtr_session_by_hostname(hostname,origin,queued)
+        command = self.run_active_responder_command_by_session_id(rtr_session['session_id'],"runscript",f'-CloudFile=\"Get-ChromeExtensions\" -CommandLine=\"\"')
+        sleep(1)
+        if command.json()['errors'] == None and command.ok:
+            command = self.run_active_responder_command_by_session_id(rtr_session['session_id'],"get",r"C:\Temp\ChromeExtensions.zip")
+            sleep(1)
+            _ = self.run_active_responder_command_by_session_id(rtr_session['session_id'],"rm",r"C:\Temp\ChromeExtensions.zip")
         return command
 
     ###
@@ -424,4 +581,3 @@ class Falcon():
         process_api = f'{self.api_base}/processes/entities/processes/v1'
         params={'ids':id}
         return self.session.get(process_api,params=params)
-
