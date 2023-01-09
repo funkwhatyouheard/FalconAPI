@@ -202,8 +202,10 @@ class Falcon():
         return device_ids
 
     def get_device_details_by_id(self,device_ids):
-        device_detail_api = f'{self.api_base}/devices/entities/devices/v1'
-        search = self.session.get(url=device_detail_api, params={"ids":device_ids})
+        device_detail_api = f'{self.api_base}/devices/entities/devices/v2'
+        if not isinstance(device_ids,list):
+            device_ids = [device_ids]
+        search = self.session.post(url=device_detail_api,json={"ids":device_ids})
         self.check_response(search)
         if len(search.json()['resources']) < 1:
             raise ValueError("No devices found by that name. Ensure case and spelling is correct.")
