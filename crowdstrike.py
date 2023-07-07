@@ -495,6 +495,12 @@ class Falcon():
         rtr_session = self.new_rtr_session_by_hostname(hostname,origin,queued)
         command = self.run_active_responder_command_by_session_id(rtr_session['session_id'],base_command,command_string,admin)
         return command
+    
+    def get_active_responder_command_result(self,cloud_request_id,sequence_id=0):
+        params = {'cloud_request_id':cloud_request_id,'sequence_id':sequence_id}
+        result = self.session.get('{0}/real-time-response/entities/active-responder-command/v1'.format(self.api_base),params=params)
+        self.check_response(result)
+        return result.json()['resources'][0]['stdout']
 
     def get_file_by_hostname(self,hostname,filepath,origin,queued=False):
         command = self.run_active_responder_command_by_hostname(hostname,origin,"get",filepath,queued)
@@ -543,6 +549,43 @@ class Falcon():
             sleep(1)
             _ = self.run_active_responder_command_by_session_id(rtr_session['session_id'],"rm",r"C:\Temp\ChromeExtensions.zip")
         return command
+
+    def get_sensor_version(self,filter,limit=1,sort="release_date|desc"):
+        params = {
+            "filter":filter,
+            "limit":limit,
+            "sort":sort
+        }
+        sensor = self.session.get("{0}/sensors/combined/installers/v1".format(self.api_base),params=params)
+        self.check_response(sensor)
+        return sensor.json()['resources']
+
+    def get_latest_sensor_version(self,filter):
+        sensor = self.get_sensor_version(filter)
+        return sensor[0]
+
+    def get_sensor(self,sha256):
+        params = {
+            "id":sha256
+        }
+        sensor = self.session.get("{0}/sensors/entities/download-installer/v1".format(self.api_base),params=params)
+        self.check_response(sensor)
+        return sensor
+
+    def download_sensor(self,sha256,filepath):
+        sensor = self.get_sensor(sha256)
+        with open(filepath,"wb") as file:
+            file.write(sensor.content)
+        return True
+
+    def download_latest_sensor(self,filter,filepath):
+        sha256 = self.get_latest_sensor_version(filter)['sha256']
+        return self.download_sensor(sha256,filepath)
+
+
+    def download_latest_ubuntu_sensor(self,filepath):
+        filter = "os:'Ubuntu'+os_version:!'*arm64'"
+        return self.download_latest_sensor(filter,filepath)
 
     ###
     # new dev
